@@ -1,0 +1,6 @@
+{
+  "name": "Manga Sequential Image Downloader",
+  "description": "Download manga chapter pages and images sequentially in ZIP, individual files, or PDF from allinonemanga and webtoon links.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
