@@ -1,12 +1,27 @@
 import dns from 'dns';
-dns.setDefaultResultOrder('ipv4first');
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  // ignore
+}
 
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 
 const app = express();
 const PORT = 3000;
+
+// Enable CORS
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With,Content-Type,Authorization,Cookie');
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
 
 app.use(express.json());
 
@@ -62,7 +77,7 @@ async function safeJsonParse(res: globalThis.Response): Promise<{ ok: boolean; d
     }
     const data = JSON.parse(text);
     return { ok: true, data };
-  } catch (err) {
+  } catch {
     return { ok: false, data: null };
   }
 }
@@ -74,7 +89,6 @@ function extractIdentifier(input: string): { type: 'chapter' | 'manga' | 'unknow
   // 1. Direct UUID pattern
   const uuidMatch = trimmed.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
   if (uuidMatch) {
-    // If URL contains '/manga/', treat as manga ID, else chapter ID
     if (trimmed.includes('/manga/')) {
       return { type: 'manga', id: uuidMatch[0] };
     }
@@ -102,7 +116,7 @@ function extractIdentifier(input: string): { type: 'chapter' | 'manga' | 'unknow
   return { type: 'unknown', id: trimmed };
 }
 
-// Format and parse user-provided cookie or token string (supports DevTools tabbed copy, raw token, multiple lines)
+// Format and parse user-provided cookie or token string
 export function parseAnyCookieInput(input?: string): string {
   if (!input || !input.trim()) return '';
   const lines = input.trim().split(/[\r\n]+/);
@@ -112,7 +126,6 @@ export function parseAnyCookieInput(input?: string): string {
     const trimmed = line.trim();
     if (!trimmed) continue;
 
-    // Check if tab-separated (from DevTools Cookies table copy)
     if (trimmed.includes('\t')) {
       const parts = trimmed.split('\t').map((s) => s.trim()).filter(Boolean);
       if (parts.length >= 2) {
@@ -125,7 +138,6 @@ export function parseAnyCookieInput(input?: string): string {
       }
     }
 
-    // Check if standard key=value; key2=value2
     if (trimmed.includes('=')) {
       const subParts = trimmed.split(';').map((s) => s.trim()).filter(Boolean);
       for (const sp of subParts) {
@@ -136,7 +148,6 @@ export function parseAnyCookieInput(input?: string): string {
       continue;
     }
 
-    // If it is a Bearer token
     if (trimmed.startsWith('Bearer ') || trimmed.startsWith('bearer ')) {
       const token = trimmed.replace(/^bearer\s+/i, '');
       cookiePairs.push(`session_token=${token}`);
@@ -144,7 +155,6 @@ export function parseAnyCookieInput(input?: string): string {
       continue;
     }
 
-    // Raw token value
     cookiePairs.push(`session_token=${trimmed}`);
     cookiePairs.push(`token=${trimmed}`);
   }
@@ -169,7 +179,6 @@ function buildAuthHeaders(auth?: string): Record<string, string> {
     headers['Cookie'] = cookieStr;
   }
 
-  // Also extract session_token or token for Authorization header if present
   const match = cookieStr.match(/(?:session_token|token)=([^;]+)/);
   if (match && match[1]) {
     headers['Authorization'] = `Bearer ${match[1].trim()}`;
@@ -179,167 +188,6 @@ function buildAuthHeaders(auth?: string): Record<string, string> {
 
   return headers;
 }
-
-// Health check
-app.get('/api/health', (req: Request, res: Response) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Direct in-app login to AllInOneManga
-app.post('/api/auth/login', async (req: Request, res: Response) => {
-  try {
-    const { emailOrUsername, password } = req.body;
-    if (!emailOrUsername || !password) {
-      return res.status(400).json({
-        success: false,
-        error: 'Email or Username and Password are required',
-      });
-    }
-
-    const loginRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/auth/login`, {
-      method: 'POST',
-      headers: {
-        'User-Agent': MOBILE_UA,
-        'Content-Type': 'application/json',
-        'Origin': ALLINONE_BASE,
-        'Referer': `${ALLINONE_BASE}/login`,
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify({
-        emailOrUsername: String(emailOrUsername).trim(),
-        password: String(password),
-      }),
-    });
-
-    // Extract cookies from response
-    const setCookieHeaders = typeof (loginRes.headers as any).getSetCookie === 'function'
-      ? (loginRes.headers as any).getSetCookie()
-      : [loginRes.headers.get('set-cookie')].filter(Boolean);
-
-    const extractedCookies: string[] = [];
-    for (const cookieItem of setCookieHeaders) {
-      if (typeof cookieItem === 'string') {
-        const firstPart = cookieItem.split(';')[0];
-        if (firstPart) extractedCookies.push(firstPart.trim());
-      }
-    }
-
-    const json = await safeJsonParse(loginRes);
-
-    if (!loginRes.ok || (json.ok && json.data && json.data.success === false)) {
-      let errMsg = 'Login failed';
-      if (json.ok && json.data) {
-        if (typeof json.data.error === 'string') {
-          errMsg = json.data.error;
-        } else if (json.data.error?.message) {
-          errMsg = json.data.error.message;
-        } else if (json.data.message) {
-          errMsg = json.data.message;
-        }
-      }
-      return res.status(loginRes.status || 401).json({
-        success: false,
-        error: errMsg,
-      });
-    }
-
-    // Capture token if present in JSON body
-    const bodyData = (json.ok && json.data) ? json.data : {};
-    const token = bodyData.token || bodyData.sessionToken || bodyData.accessToken || bodyData.jwt || '';
-    if (token) {
-      extractedCookies.push(`session_token=${token}`);
-      extractedCookies.push(`token=${token}`);
-    }
-
-    const authString = extractedCookies.length > 0 ? extractedCookies.join('; ') : (token ? `token=${token}` : '');
-
-    return res.json({
-      success: true,
-      authString: authString || token,
-      token: token,
-      user: bodyData.user || bodyData.profile || null,
-      message: 'Login successful!',
-    });
-  } catch (err: any) {
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Login error occurred',
-    });
-  }
-});
-
-// Verify Auth Token / Session
-app.post('/api/auth/verify', async (req: Request, res: Response) => {
-  try {
-    const { auth } = req.body;
-    if (!auth || !auth.trim()) {
-      return res.status(400).json({ success: false, error: 'No auth credentials provided' });
-    }
-
-    const headers = {
-      ...buildAuthHeaders(auth),
-      'Accept': 'application/json',
-    };
-
-    const meRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/auth/me`, {
-      headers,
-    });
-
-    const json = await safeJsonParse(meRes);
-    if (meRes.ok && json.ok && json.data && json.data.success !== false) {
-      return res.json({
-        success: true,
-        valid: true,
-        user: json.data.user || json.data,
-      });
-    }
-
-    return res.json({
-      success: true,
-      valid: meRes.status !== 401 && meRes.status !== 403,
-      status: meRes.status,
-    });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// Unlock Chapter Endpoint
-app.post('/api/manga/unlock', async (req: Request, res: Response) => {
-  try {
-    const { chapterId, auth } = req.body;
-    if (!chapterId) {
-      return res.status(400).json({ success: false, error: 'Chapter ID is required' });
-    }
-
-    const headers = {
-      ...buildAuthHeaders(auth),
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    };
-
-    const unlockRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/chapter/${chapterId}/unlock`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({}),
-    });
-
-    const json = await safeJsonParse(unlockRes);
-    if (!unlockRes.ok || (json.ok && json.data && json.data.success === false)) {
-      return res.status(unlockRes.status || 400).json({
-        success: false,
-        error: json.data?.error || `Unlock failed (${unlockRes.status})`,
-      });
-    }
-
-    return res.json({
-      success: true,
-      data: json.data || { unlocked: true },
-    });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message || 'Unlock error' });
-  }
-});
 
 // Helper to scrape images from external Manga sites (WordPress Madara, MangaMango, etc.)
 async function scrapeExternalMangaUrl(targetUrl: string) {
@@ -363,7 +211,6 @@ async function scrapeExternalMangaUrl(targetUrl: string) {
     let mangaTitle = 'Manga';
     let chapterTitle = 'Chapter';
 
-    // 1. Extract Manga & Chapter title
     const ogMatch = html.match(/<meta property=["']og:title["'] content=["']([^"']+)["']/i) || html.match(/<title>([^<]+)<\/title>/i);
     if (ogMatch) {
       const fullTitle = ogMatch[1].replace(/&amp;/g, '&').replace(/&#8211;/g, '-').trim();
@@ -376,18 +223,15 @@ async function scrapeExternalMangaUrl(targetUrl: string) {
       }
     }
 
-    // Try input value for chapter title (Madara theme)
     const hiddenChapMatch = html.match(/id=["']wp-manga-current-chap["'][^>]*value=["']([^"']+)["']/i) ||
                              html.match(/value=["']([^"']+)["'][^>]*id=["']wp-manga-current-chap["']/i);
     if (hiddenChapMatch) {
       chapterTitle = hiddenChapMatch[1].replace(/[-_]/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
     }
 
-    // Cover image
     const ogImgMatch = html.match(/<meta property=["']og:image["'] content=["']([^"']+)["']/i);
     const coverUrl = ogImgMatch ? ogImgMatch[1].trim() : null;
 
-    // 2. Extract manga pages
     const imgRegex = /<img[^>]+(?:src|data-src|data-lazy-src)=["']\s*(https?:\/\/[^"'\s<>]+)\s*["'][^>]*>/gi;
     const rawPageUrls: string[] = [];
     let m;
@@ -409,7 +253,6 @@ async function scrapeExternalMangaUrl(targetUrl: string) {
       }
     }
 
-    // Fallback: if no specific manga image tags found, grab all http images with typical formats
     if (rawPageUrls.length === 0) {
       const generalImgRegex = /(https?:\/\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp|avif)(?:\?[^\s"'<>]*)?)/gi;
       let g;
@@ -464,8 +307,291 @@ async function scrapeExternalMangaUrl(targetUrl: string) {
   }
 }
 
+// Router for all API routes (mounted at both /api and /)
+const apiRouter = express.Router();
+
+// Health check
+apiRouter.get('/health', (req: Request, res: Response) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Proxy image endpoint to prevent CORS & bypass restrictions
+const handleProxyImage = async (req: Request, res: Response) => {
+  try {
+    const id = req.query.id as string;
+    const url = req.query.url as string;
+    const auth = (req.query.auth as string) || (req.headers['authorization'] as string) || (req.headers['cookie'] as string);
+
+    let targetUrl = '';
+    if (id) {
+      targetUrl = `${ALLINONE_BASE}/api/v1/px/${id}`;
+    } else if (url) {
+      targetUrl = url.trim();
+    } else {
+      return res.status(400).send('Missing id or url parameter');
+    }
+
+    const authHeaders = buildAuthHeaders(auth);
+
+    let customHeaders: Record<string, string> = {
+      'User-Agent': MOBILE_UA,
+      'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      ...authHeaders,
+    };
+
+    try {
+      if (targetUrl.startsWith('http')) {
+        const parsedUrl = new URL(targetUrl);
+        customHeaders['Referer'] = `${parsedUrl.origin}/`;
+        customHeaders['Origin'] = parsedUrl.origin;
+      }
+    } catch {
+      // ignore
+    }
+
+    const imageRes = await fetchWithRetry(targetUrl, {
+      headers: customHeaders,
+    }, 2, 15000);
+
+    if (!imageRes.ok) {
+      return res.status(imageRes.status).send(`Failed to proxy image: ${imageRes.statusText}`);
+    }
+
+    const contentType = imageRes.headers.get('content-type') || 'image/jpeg';
+    const contentLength = imageRes.headers.get('content-length');
+
+    res.setHeader('Content-Type', contentType);
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const buffer = await imageRes.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (error: any) {
+    console.error('Image proxy error:', error);
+    res.status(500).send('Error proxying image');
+  }
+};
+
+// Mount image proxy routes FIRST before parameterized /manga/:id
+apiRouter.get('/manga/proxy-image', handleProxyImage);
+apiRouter.get('/proxy/image', handleProxyImage);
+
+// Direct in-app login to AllInOneManga
+apiRouter.post('/auth/login', async (req: Request, res: Response) => {
+  try {
+    const { emailOrUsername, password } = req.body;
+    if (!emailOrUsername || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email or Username and Password are required',
+      });
+    }
+
+    const loginRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': MOBILE_UA,
+        'Content-Type': 'application/json',
+        'Origin': ALLINONE_BASE,
+        'Referer': `${ALLINONE_BASE}/login`,
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        emailOrUsername: String(emailOrUsername).trim(),
+        password: String(password),
+      }),
+    });
+
+    const setCookieHeaders = typeof (loginRes.headers as any).getSetCookie === 'function'
+      ? (loginRes.headers as any).getSetCookie()
+      : [loginRes.headers.get('set-cookie')].filter(Boolean);
+
+    const extractedCookies: string[] = [];
+    for (const cookieItem of setCookieHeaders) {
+      if (typeof cookieItem === 'string') {
+        const firstPart = cookieItem.split(';')[0];
+        if (firstPart) extractedCookies.push(firstPart.trim());
+      }
+    }
+
+    const json = await safeJsonParse(loginRes);
+
+    if (!loginRes.ok || (json.ok && json.data && json.data.success === false)) {
+      let errMsg = 'Login failed';
+      if (json.ok && json.data) {
+        if (typeof json.data.error === 'string') {
+          errMsg = json.data.error;
+        } else if (json.data.error?.message) {
+          errMsg = json.data.error.message;
+        } else if (json.data.message) {
+          errMsg = json.data.message;
+        }
+      }
+      return res.status(loginRes.status || 401).json({
+        success: false,
+        error: errMsg,
+      });
+    }
+
+    const bodyData = (json.ok && json.data) ? json.data : {};
+    const token = bodyData.token || bodyData.sessionToken || bodyData.accessToken || bodyData.jwt || '';
+    if (token) {
+      extractedCookies.push(`session_token=${token}`);
+      extractedCookies.push(`token=${token}`);
+    }
+
+    const finalCookieString = extractedCookies.join('; ');
+
+    return res.json({
+      success: true,
+      data: {
+        user: bodyData.user || { emailOrUsername },
+        token: token,
+        cookieString: finalCookieString,
+      },
+    });
+  } catch (error: any) {
+    console.error('Login error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Login request failed. Check server connection.',
+    });
+  }
+});
+
+// Search manga titles
+apiRouter.post('/manga/search', async (req: Request, res: Response) => {
+  try {
+    const { query } = req.body;
+    if (!query || typeof query !== 'string') {
+      return res.status(400).json({ success: false, error: 'Query string is required' });
+    }
+
+    const encodedQuery = encodeURIComponent(query.trim());
+    const searchUrl = `${ALLINONE_BASE}/api/v1/manga/search?q=${encodedQuery}`;
+
+    const response = await fetchWithRetry(searchUrl, {
+      headers: {
+        'User-Agent': MOBILE_UA,
+        'Referer': ALLINONE_BASE + '/',
+        'Origin': ALLINONE_BASE,
+      },
+    });
+
+    const json = await safeJsonParse(response);
+    if (!response.ok || !json.ok) {
+      return res.status(response.status || 500).json({
+        success: false,
+        error: json.data?.error || 'Failed to search manga on provider.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: json.data?.data || json.data || [],
+    });
+  } catch (error: any) {
+    console.error('Error searching manga:', error);
+    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
+  }
+});
+
+// Get manga details
+apiRouter.get('/manga/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const response = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${id}`, {
+      headers: {
+        'User-Agent': MOBILE_UA,
+        'Referer': ALLINONE_BASE + '/',
+      },
+    });
+
+    const json = await safeJsonParse(response);
+    if (!response.ok || !json.ok) {
+      return res.status(response.status || 500).json({
+        success: false,
+        error: json.data?.error || 'Failed to fetch manga details.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: json.data?.data || json.data,
+    });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
+  }
+});
+
+// Get chapters for manga
+apiRouter.get('/manga/:id/chapters', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const response = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${id}/chapters`, {
+      headers: {
+        'User-Agent': MOBILE_UA,
+        'Referer': ALLINONE_BASE + '/',
+      },
+    });
+
+    const json = await safeJsonParse(response);
+    if (!response.ok || !json.ok) {
+      return res.status(response.status || 500).json({
+        success: false,
+        error: json.data?.error || 'Failed to fetch chapters.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: json.data?.data || json.data || [],
+    });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, error: error.message || 'Internal server error' });
+  }
+});
+
+// Unlock single chapter
+apiRouter.post('/manga/chapter/:id/unlock', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { auth } = req.body;
+
+    const authHeaders = buildAuthHeaders(auth);
+    const unlockRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/chapter/${id}/unlock`, {
+      method: 'POST',
+      headers: {
+        ...authHeaders,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+
+    const json = await safeJsonParse(unlockRes);
+
+    if (!unlockRes.ok) {
+      return res.status(unlockRes.status).json({
+        success: false,
+        error: json.data?.error || `Unlock failed (${unlockRes.status})`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: json.data || { unlocked: true },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message || 'Unlock error' });
+  }
+});
+
 // Resolve manga/chapter info and pages
-app.post('/api/manga/resolve', async (req: Request, res: Response) => {
+apiRouter.post('/manga/resolve', async (req: Request, res: Response) => {
   try {
     const { url, auth } = req.body;
     if (!url || typeof url !== 'string' || !url.trim()) {
@@ -494,7 +620,6 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
     let mangaInfo: any = null;
     let chaptersList: any[] = [];
 
-    // If a manga slug or manga UUID was provided instead of a direct chapter
     if (parsed.type === 'manga') {
       const mangaRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${parsed.id}`, {
         headers: {
@@ -509,7 +634,6 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
         mangaInfo = mangaJson.data.data;
       }
 
-      // Fetch chapters list for this manga
       const chaptersRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${parsed.id}/chapters`, {
         headers: {
           'User-Agent': MOBILE_UA,
@@ -520,7 +644,6 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
       const chaptersJson = await safeJsonParse(chaptersRes);
       if (chaptersJson.ok && Array.isArray(chaptersJson.data?.data) && chaptersJson.data.data.length > 0) {
         chaptersList = chaptersJson.data.data;
-        // Select the first chapter by default
         targetChapterId = chaptersList[0].id;
       }
     } else {
@@ -561,7 +684,6 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
 
     const authHeaders = buildAuthHeaders(auth);
 
-    // If auth is provided, try unlocking first in case it is locked
     if (auth && auth.trim()) {
       try {
         await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/chapter/${targetChapterId}/unlock`, {
@@ -599,7 +721,6 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
           : `${ALLINONE_BASE}/${mangaInfo.coverUrl.replace(/^\/+/, '')}`;
       }
 
-      // Return 200 with locked payload so client UI handles the unlock prompt gracefully
       return res.json({
         success: false,
         locked: isLocked,
@@ -619,6 +740,7 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
         error: errMsg,
       });
     }
+
     if (!pagesJson.ok || !pagesJson.data) {
       return res.status(502).json({
         success: false,
@@ -635,7 +757,6 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
       });
     }
 
-    // Sort sequentially by pageNumber
     const sortedPages = [...rawPages].sort((a, b) => (a.pageNumber || 0) - (b.pageNumber || 0));
 
     const formattedPages = sortedPages.map((p, index) => {
@@ -700,77 +821,14 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
   }
 });
 
-// Proxy image endpoint to prevent CORS & bypass restrictions
-const handleProxyImage = async (req: Request, res: Response) => {
-  try {
-    const id = req.query.id as string;
-    const url = req.query.url as string;
-    const auth = (req.query.auth as string) || (req.headers['authorization'] as string) || (req.headers['cookie'] as string);
+// Mount router on both /api and / so it works seamlessly in standalone and serverless rewrite mode
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
 
-    let targetUrl = '';
-    if (id) {
-      targetUrl = `${ALLINONE_BASE}/api/v1/px/${id}`;
-    } else if (url) {
-      targetUrl = url.trim();
-    } else {
-      return res.status(400).send('Missing id or url parameter');
-    }
-
-    const authHeaders = buildAuthHeaders(auth);
-
-    // If external URL, dynamically set Origin and Referer
-    let customHeaders: Record<string, string> = { ...authHeaders };
-    try {
-      if (targetUrl.startsWith('http')) {
-        const parsedUrl = new URL(targetUrl);
-        customHeaders['Referer'] = `${parsedUrl.origin}/`;
-        customHeaders['Origin'] = parsedUrl.origin;
-      }
-    } catch {
-      // ignore
-    }
-
-    const imageRes = await fetchWithRetry(targetUrl, {
-      headers: customHeaders,
-    }, 2, 12000);
-
-    if (!imageRes.ok) {
-      return res.status(imageRes.status).send(`Failed to proxy image: ${imageRes.statusText}`);
-    }
-
-    const contentType = imageRes.headers.get('content-type') || 'image/jpeg';
-    const contentLength = imageRes.headers.get('content-length');
-
-    res.setHeader('Content-Type', contentType);
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
-    }
-    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    const buffer = await imageRes.arrayBuffer();
-    res.send(Buffer.from(buffer));
-  } catch (error: any) {
-    console.error('Image proxy error:', error);
-    res.status(500).send('Error proxying image');
-  }
-};
-
-app.get('/api/manga/proxy-image', handleProxyImage);
-app.get('/api/proxy/image', handleProxyImage);
-
-// Explicit 404 handler for any unhandled /api requests to prevent Vite from returning index.html
-app.all('/api/*', (req: Request, res: Response) => {
-  res.status(404).json({
-    success: false,
-    error: `API route not found: ${req.method} ${req.path}`,
-  });
-});
-
-// Global JSON error handler for /api
+// Global JSON error handler
 app.use((err: any, req: Request, res: Response, next: any) => {
   console.error('Unhandled server error:', err);
-  if (req.path.startsWith('/api')) {
+  if (req.path.startsWith('/api') || req.path.startsWith('/manga')) {
     return res.status(err.status || 500).json({
       success: false,
       error: err.message || 'Internal server error',
@@ -780,8 +838,9 @@ app.use((err: any, req: Request, res: Response, next: any) => {
 });
 
 async function startServer() {
-  // Vite middleware in development
   if (process.env.NODE_ENV !== 'production') {
+    // Dynamic import to prevent bundling Vite in production serverless runtime
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
