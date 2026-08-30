@@ -155,8 +155,8 @@ export function buildAuthHeaders(auth?: string): Record<string, string> {
     'User-Agent': MOBILE_UA,
     'Referer': ALLINONE_BASE + '/',
     'Origin': ALLINONE_BASE,
-    'X-Client-Type': 'WEB',
-    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    'X-Client-Type': 'IOS',
+    'Accept': 'application/json, text/plain, */*',
   };
 
   if (!auth || !auth.trim()) {
@@ -611,7 +611,7 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
     let mangaDetails: any = null;
     let chaptersList: any[] = [];
 
-    // If a manga ID was given, retrieve the manga info and pick the first chapter
+    // If a manga ID or slug was given, retrieve the manga info and fetch chapters
     if (type === 'manga') {
       const mangaRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${id}`, {
         headers: {
@@ -629,8 +629,30 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
         });
       }
 
-      mangaDetails = mangaJson.data?.manga || mangaJson.data;
-      chaptersList = mangaJson.data?.chapters || mangaDetails?.chapters || [];
+      mangaDetails = mangaJson.data?.data || mangaJson.data?.manga || mangaJson.data;
+      const actualMangaId = mangaDetails?.id || id;
+
+      // Fetch full chapters list from API
+      try {
+        const chapsRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${actualMangaId}/chapters?page=1&limit=500&sort=asc`, {
+          headers: {
+            ...authHeaders,
+            'Accept': 'application/json',
+          },
+        });
+        const chapsJson = await safeJsonParse(chapsRes);
+        const fetchedChapters = Array.isArray(chapsJson.data?.data)
+          ? chapsJson.data.data
+          : (Array.isArray(chapsJson.data) ? chapsJson.data : []);
+
+        if (fetchedChapters.length > 0) {
+          chaptersList = fetchedChapters;
+        } else {
+          chaptersList = mangaJson.data?.data?.chapters || mangaJson.data?.chapters || mangaDetails?.chapters || [];
+        }
+      } catch {
+        chaptersList = mangaJson.data?.data?.chapters || mangaJson.data?.chapters || mangaDetails?.chapters || [];
+      }
 
       if (chaptersList.length === 0) {
         return res.status(404).json({
@@ -639,46 +661,101 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
         });
       }
 
-      // Sort chapters ascending by chapter number (default to reading from start or pick latest)
-      chaptersList.sort((a: any, b: any) => (a.number || a.chapterNumber || 0) - (b.number || b.chapterNumber || 0));
+      // Sort chapters ascending by chapter number (default to reading from start)
+      chaptersList.sort((a: any, b: any) => (parseFloat(a.number || a.chapterNumber || 0)) - (parseFloat(b.number || b.chapterNumber || 0)));
       chapterIdToFetch = chaptersList[0].id;
     }
 
-    // Fetch Chapter Details
-    const chapterUrl = `${ALLINONE_BASE}/api/v1/manga/chapter/${chapterIdToFetch}`;
-    const chapterRes = await fetchWithRetry(chapterUrl, {
-      headers: {
-        ...authHeaders,
-        'Accept': 'application/json',
-      },
-    });
-
-    const chapterJson = await safeJsonParse(chapterRes);
-
-    if (!chapterRes.ok || !chapterJson.ok) {
-      // If unauthorized (401) or locked (403)
-      if (chapterRes.status === 401 || chapterRes.status === 403) {
-        return res.status(chapterRes.status).json({
-          success: false,
-          isLocked: true,
-          error: chapterRes.status === 401
-            ? 'This chapter requires an AllInOneManga login session or authorization token.'
-            : 'This chapter is locked or premium. Please unlock it using coins or provide an authenticated session token.',
-          chapterId: chapterIdToFetch,
-        });
-      }
-
-      return res.status(chapterRes.status || 502).json({
-        success: false,
-        error: `Failed to fetch chapter details from AllInOneManga (HTTP ${chapterRes.status})`,
+    // 1. Fetch Chapter Info (contains chapter metadata, parent manga info, and sibling chapters list)
+    let chapterData: any = null;
+    try {
+      const infoUrl = `${ALLINONE_BASE}/api/v1/manga/chapter/${chapterIdToFetch}/info`;
+      const infoRes = await fetchWithRetry(infoUrl, {
+        headers: {
+          ...authHeaders,
+          'Accept': 'application/json',
+        },
       });
+      const infoJson = await safeJsonParse(infoRes);
+      if (infoRes.ok && infoJson.ok) {
+        const payload = infoJson.data?.data || infoJson.data;
+        chapterData = payload?.chapter || payload;
+        if (payload?.manga && !mangaDetails) {
+          mangaDetails = payload.manga;
+        }
+        if (Array.isArray(payload?.chapters) && chaptersList.length === 0) {
+          chaptersList = payload.chapters;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not fetch chapter/info:', e);
     }
 
-    const chapterData = chapterJson.data?.chapter || chapterJson.data;
-    const parentManga = chapterJson.data?.manga || mangaDetails;
+    // Fallback: If chapterData is still missing, try standard chapter endpoint
+    if (!chapterData) {
+      const chapterUrl = `${ALLINONE_BASE}/api/v1/manga/chapter/${chapterIdToFetch}`;
+      const chapterRes = await fetchWithRetry(chapterUrl, {
+        headers: {
+          ...authHeaders,
+          'Accept': 'application/json',
+        },
+      });
+      const chapterJson = await safeJsonParse(chapterRes);
+      if (chapterRes.ok && chapterJson.ok) {
+        const payload = chapterJson.data?.data || chapterJson.data;
+        chapterData = payload?.chapter || payload;
+        if (payload?.manga && !mangaDetails) {
+          mangaDetails = payload.manga;
+        }
+      }
+    }
 
-    // Extract pages
-    const rawPages = chapterData?.pages || chapterData?.images || [];
+    // 2. Fetch Chapter Pages from /api/v1/manga/chapter/:id/pages
+    let rawPages: any[] = [];
+    let isChapterLocked = false;
+    let lockErrorMessage = '';
+
+    try {
+      const pagesUrl = `${ALLINONE_BASE}/api/v1/manga/chapter/${chapterIdToFetch}/pages`;
+      const pagesRes = await fetchWithRetry(pagesUrl, {
+        headers: {
+          ...authHeaders,
+          'Accept': 'application/json',
+        },
+      });
+      const pagesJson = await safeJsonParse(pagesRes);
+
+      if (pagesRes.status === 401 || pagesRes.status === 403) {
+        isChapterLocked = true;
+        const errObj = pagesJson.data?.data || pagesJson.data || {};
+        lockErrorMessage = errObj.message || errObj.error || (pagesRes.status === 401
+          ? 'This chapter requires an AllInOneManga login session or authorization token.'
+          : 'This chapter is locked or requires coins to read.');
+      } else if (pagesRes.ok && pagesJson.ok) {
+        const payload = pagesJson.data?.data || pagesJson.data;
+        if (Array.isArray(payload)) {
+          rawPages = payload;
+        } else if (Array.isArray(payload?.pages)) {
+          rawPages = payload.pages;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not fetch chapter pages from /pages endpoint:', e);
+    }
+
+    // Fallback to pages embedded inside chapterData if /pages endpoint didn't return pages
+    if (rawPages.length === 0 && chapterData?.pages && Array.isArray(chapterData.pages)) {
+      rawPages = chapterData.pages;
+    }
+
+    if (isChapterLocked) {
+      return res.status(403).json({
+        success: false,
+        isLocked: true,
+        error: lockErrorMessage || 'This chapter is locked. Please log in with your AllInOneManga account or provide a session token.',
+        chapterId: chapterIdToFetch,
+      });
+    }
 
     if (!rawPages || rawPages.length === 0) {
       return res.status(404).json({
@@ -701,7 +778,7 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
         id: pageId,
         pageNumber: pageNum,
         formattedIndex: padIndex,
-        rawUrl: page.url || null,
+        rawUrl: page.imageUrl || page.url || null,
         proxyUrl: proxyUrl,
         format: page.format || 'JPG',
         contentType: page.contentType || 'image/jpeg',
@@ -710,38 +787,52 @@ app.post('/api/manga/resolve', async (req: Request, res: Response) => {
       };
     });
 
-    // If manga details were not fetched initially, fetch parent manga to get all chapters
-    if (!mangaDetails && chapterData.mangaId) {
+    // If manga details or chapters were not fetched initially, fetch parent manga to get full chapter listing
+    const parentMangaId = chapterData?.mangaId || mangaDetails?.id;
+    if (parentMangaId && chaptersList.length === 0) {
       try {
-        const parentRes = await fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${chapterData.mangaId}`, {
-          headers: {
-            ...authHeaders,
-            'Accept': 'application/json',
-          },
-        });
+        const [parentRes, chapsRes] = await Promise.all([
+          fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${parentMangaId}`, {
+            headers: {
+              ...authHeaders,
+              'Accept': 'application/json',
+            },
+          }),
+          fetchWithRetry(`${ALLINONE_BASE}/api/v1/manga/${parentMangaId}/chapters?page=1&limit=500&sort=asc`, {
+            headers: {
+              ...authHeaders,
+              'Accept': 'application/json',
+            },
+          }),
+        ]);
+
         const parentJson = await safeJsonParse(parentRes);
-        if (parentRes.ok && parentJson.ok) {
+        if (parentRes.ok && parentJson.ok && !mangaDetails) {
           mangaDetails = parentJson.data?.manga || parentJson.data;
-          chaptersList = parentJson.data?.chapters || mangaDetails?.chapters || [];
+        }
+
+        const chapsJson = await safeJsonParse(chapsRes);
+        if (chapsRes.ok && chapsJson.ok && Array.isArray(chapsJson.data)) {
+          chaptersList = chapsJson.data;
         }
       } catch (err) {
         console.warn('Could not fetch parent manga metadata:', err);
       }
     }
 
-    const mangaTitle = parentManga?.title || chapterData?.mangaTitle || 'Manga';
-    const mangaSlug = parentManga?.slug || mangaTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-    const chapterTitle = chapterData.title || `Chapter ${chapterData.chapterNumber || chapterData.number || 1}`;
+    const mangaTitle = mangaDetails?.title || chapterData?.mangaTitle || 'Manga';
+    const mangaSlug = mangaDetails?.slug || mangaTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    const chapterTitle = chapterData?.title || `Chapter ${chapterData?.chapterNumber || chapterData?.number || 1}`;
 
     return res.json({
       success: true,
       data: {
-        chapterId: chapterData.id || chapterIdToFetch,
+        chapterId: chapterData?.id || chapterIdToFetch,
         mangaTitle: decodeHtmlEntities(mangaTitle),
         mangaSlug: mangaSlug,
-        mangaCoverUrl: parentManga?.coverImage || parentManga?.coverUrl || chapterData.coverUrl || null,
+        mangaCoverUrl: mangaDetails?.coverUrl || mangaDetails?.coverImage || chapterData?.coverUrl || null,
         chapterTitle: decodeHtmlEntities(chapterTitle),
-        chapterNumber: chapterData.chapterNumber || chapterData.number || 1,
+        chapterNumber: chapterData?.chapterNumber || chapterData?.number || 1,
         totalPages: formattedPages.length,
         pages: formattedPages,
         allChapters: chaptersList.map((c: any) => ({
