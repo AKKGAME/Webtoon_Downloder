@@ -98,6 +98,25 @@ export default function App() {
     } else {
       localStorage.removeItem(AUTH_STORAGE_KEY);
     }
+
+    // Refresh proxy URLs in loaded chapterData if already present
+    if (chapterData && chapterData.pages) {
+      const updatedPages = chapterData.pages.map((p) => {
+        let baseProxy = p.proxyUrl ? p.proxyUrl.replace(/([?&])auth=[^&]*/g, '') : `/api/manga/proxy-image?id=${encodeURIComponent(p.id)}`;
+        if (newToken) {
+          const sep = baseProxy.includes('?') ? '&' : '?';
+          baseProxy = `${baseProxy}${sep}auth=${encodeURIComponent(newToken)}`;
+        }
+        return {
+          ...p,
+          proxyUrl: baseProxy,
+        };
+      });
+      setChapterData({
+        ...chapterData,
+        pages: updatedPages,
+      });
+    }
   };
 
   const saveHistoryItem = (data: ChapterData, originalUrl: string) => {
@@ -361,6 +380,7 @@ export default function App() {
           paddingDigits,
           onProgress: setProgress,
           signal,
+          authToken,
         });
       } else if (format === 'individual') {
         await downloadSequentiallyIndividual({
@@ -370,6 +390,7 @@ export default function App() {
           delayMs: 300,
           onProgress: setProgress,
           signal,
+          authToken,
         });
       } else if (format === 'pdf') {
         await downloadAsPdf({
@@ -378,6 +399,7 @@ export default function App() {
           paddingDigits,
           onProgress: setProgress,
           signal,
+          authToken,
         });
       }
     } catch (err: any) {
@@ -412,7 +434,7 @@ export default function App() {
   // Download a single page immediately
   const handleDownloadSinglePage = async (page: MangaPage) => {
     try {
-      const { blob, ext } = await fetchPageBlob(page);
+      const { blob, ext } = await fetchPageBlob(page, undefined, 2, authToken);
       const filename = formatPageFilename(
         prefix || (chapterData?.mangaTitle || 'manga'),
         page.pageNumber,
@@ -450,10 +472,19 @@ export default function App() {
         {errorMsg && (
           <div className="p-4 rounded-xl bg-red-950/60 border border-red-800/80 text-red-300 text-xs sm:text-sm flex items-start gap-3 shadow-lg">
             <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-            <div>
+            <div className="flex-1">
               <p className="font-bold">Error loading manga link</p>
               <p className="mt-0.5">{errorMsg}</p>
             </div>
+            {errorMsg.toLowerCase().includes('lock') || errorMsg.includes('401') ? (
+              <button
+                type="button"
+                onClick={() => setShowUnlockModal(true)}
+                className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold shrink-0 transition-colors"
+              >
+                Unlock
+              </button>
+            ) : null}
           </div>
         )}
 
@@ -474,7 +505,12 @@ export default function App() {
 
         {/* Progress Overlay */}
         {progress.status !== 'idle' && (
-          <ProgressOverlay lang={lang} progress={progress} />
+          <ProgressOverlay
+            lang={lang}
+            progress={progress}
+            onOpenUnlockModal={() => setShowUnlockModal(true)}
+            onDismiss={() => setProgress({ status: 'idle', current: 0, total: 0, percent: 0 })}
+          />
         )}
 
         {/* Chapter Details & Controls */}
